@@ -16,6 +16,11 @@ from torchvision.transforms import transforms
 from tqdm import tqdm
 from scipy.io import loadmat
 from collections import defaultdict
+from models.explanation import (
+    load_explanation_annotations,
+    lookup_explanation_annotation,
+    normalize_explanation_annotation,
+)
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -50,6 +55,15 @@ class OSIE(Dataset):
         self.type = type
         self.transform = transform
         self.PAD = [-3, -3, -3]
+        self.explanation_enabled = bool(getattr(args, "enable_explanation", False))
+        self.explanation_store = None
+        if self.explanation_enabled:
+            annotation_path = getattr(args, "explanation_annotations", None)
+            if not annotation_path:
+                raise ValueError(
+                    "Explanation is enabled for supervised data but --explanation_annotations was not provided"
+                )
+            self.explanation_store = load_explanation_annotations(annotation_path)
 
         self.downscale_x = origin_size[1] / action_map[1]
         self.downscale_y = origin_size[0] / action_map[0]
@@ -103,6 +117,7 @@ class OSIE(Dataset):
         tasks = []
         task_embeddings = []
         target_scanpaths = []
+        explanation_annotations = []
         durations = []
         action_masks = []
         duration_masks = []
@@ -155,6 +170,11 @@ class OSIE(Dataset):
             task_embedding = self.embedding_dict[task]
             task_embeddings.append(task_embedding)
             target_scanpaths.append(target_scanpath)
+            if self.explanation_enabled:
+                raw_annotation = lookup_explanation_annotation(self.explanation_store, fixation)
+                explanation_annotations.append(
+                    normalize_explanation_annotation(raw_annotation, self.max_length, getattr(self.args, "router_kmax", 4))
+                )
 
 
         images = torch.cat(images)
@@ -168,7 +188,7 @@ class OSIE(Dataset):
         # self.show_image(image/255)
         # self.show_image(image_resized/255)
 
-        return {
+        result = {
             "image": images,
             "subject": subjects,
             "img_name": img_name,
@@ -179,6 +199,9 @@ class OSIE(Dataset):
             "task_embedding": task_embeddings,
             "target_scanpath": target_scanpaths
         }
+        if self.explanation_enabled:
+            result["explanation_annotations"] = explanation_annotations
+        return result
 
     def collate_func(self, batch):
 
@@ -191,6 +214,7 @@ class OSIE(Dataset):
         task_batch = []
         task_embedding_batch = []
         target_scanpath_batch = []
+        explanation_batch = []
 
         for sample in batch:
             tmp_img, tmp_subject, tmp_img_name, tmp_duration, tmp_action_mask, tmp_duration_mask, \
@@ -206,6 +230,8 @@ class OSIE(Dataset):
             task_batch.append(tmp_task)
             task_embedding_batch.append(tmp_task_embedding)
             target_scanpath_batch.append(tmp_target_scanpath)
+            if self.explanation_enabled:
+                explanation_batch.append(sample["explanation_annotations"])
 
         data = dict()
         data["images"] = torch.cat(img_batch)
@@ -217,6 +243,8 @@ class OSIE(Dataset):
         data["tasks"] = task_batch
         data["task_embeddings"] = np.concatenate(task_embedding_batch)
         data["target_scanpaths"] = np.concatenate(target_scanpath_batch)
+        if self.explanation_enabled:
+            data["explanation_annotations"] = explanation_batch
 
         data = {k:torch.from_numpy(v) if type(v) is np.ndarray else v for k,v in data.items()} # Turn all ndarray to torch tensor
         data = {k: v.unsqueeze(0) if type(v) is torch.Tensor else v for k, v in data.items()}
@@ -596,6 +624,3 @@ def select_fewshot_subject(log_dir, scanpaths, fewshot_subjects, num_fewshot, k,
         with open('{}/sample_{}.json'.format(save_sample_path, k), 'w') as f:
             json.dump(selected_samples, f, indent=4)
         return selected_samples
-
-
-        

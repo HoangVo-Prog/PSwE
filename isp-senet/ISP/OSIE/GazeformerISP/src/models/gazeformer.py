@@ -90,12 +90,51 @@ class CrossAttentionPredictor(nn.Module):
         return att_logit
 
 class gazeformer(nn.Module):
-    def __init__(self, transformer, spatial_dim, args, subject_num, subject_feature_dim, action_map_num, dropout=0.4, max_len = 7, patch_size  = 16, device = "cuda:0"):
+    def __init__(self, transformer, spatial_dim, args, subject_num, subject_feature_dim, action_map_num, dropout=0.4, max_len = 7, patch_size  = 16, device = "cuda:0", explanation_module=None):
         super(gazeformer, self).__init__()
         self.args = args
         self.spatial_dim = spatial_dim
         self.transformer = transformer
         self.hidden_dim = transformer.d_model
+        self.enable_explanation = bool(getattr(args, "enable_explanation", False))
+        # The module is injected here so tests and downstream experiments can
+        # provide tiny/offline implementations.  Disabled mode intentionally
+        # does not import or instantiate any explanation dependency.
+        if self.enable_explanation and explanation_module is None:
+            from models.explanation import HierarchicalExplanationModule
+
+            semantic_encoder = getattr(args, "explanation_semantic_encoder", None)
+            causal_lm = getattr(args, "explanation_causal_lm", None)
+            self.explanation_module = HierarchicalExplanationModule(
+                decoder_dim=self.hidden_dim,
+                visual_dim=self.hidden_dim,
+                latent_dim=getattr(args, "explanation_dim", 256),
+                spatial_dim=spatial_dim,
+                max_length=max_len,
+                kmax=getattr(args, "router_kmax", 4),
+                semantic_encoder=semantic_encoder,
+                semantic_encoder_name=getattr(args, "semantic_encoder_name", None),
+                semantic_encoder_dim=getattr(args, "semantic_encoder_dim", None),
+                freeze_semantic_encoder=getattr(args, "freeze_semantic_encoder", True),
+                causal_lm=causal_lm,
+                causal_lm_name=getattr(args, "explanation_llm_name", None),
+                causal_lm_hidden_dim=getattr(args, "explanation_llm_hidden_dim", None),
+                causal_lm_tokenizer=getattr(args, "explanation_llm_tokenizer", None),
+                freeze_causal_lm=getattr(args, "freeze_explanation_llm", True),
+                global_dim=getattr(args, "how_hidden_dim", None),
+                lambda_exp_what=getattr(args, "lambda_exp_what", 1.0),
+                lambda_exp_why=getattr(args, "lambda_exp_why", 1.0),
+                lambda_exp_how=getattr(args, "lambda_exp_how", 1.0),
+                lambda_what_txt=getattr(args, "lambda_what_txt", 1.0),
+                lambda_what_align=getattr(args, "lambda_what_align", 1.0),
+                lambda_route=getattr(args, "lambda_route", 1.0),
+                lambda_why_txt=getattr(args, "lambda_why_txt", 1.0),
+                lambda_why_align=getattr(args, "lambda_why_align", 1.0),
+                lambda_how_txt=getattr(args, "lambda_how_txt", 1.0),
+                lambda_how_align=getattr(args, "lambda_how_align", 1.0),
+            )
+        else:
+            self.explanation_module = explanation_module if self.enable_explanation else None
         # subject embeddings
         # self.subject_embed = nn.Embedding(subject_num, subject_feature_dim)
         print(f'load user embedding from {args.user_emb_path}')
@@ -165,16 +204,16 @@ class gazeformer(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps*std
         
-    def forward(self, src: Tensor, subjects: Tensor, task: Tensor):
+    def forward(self, src: Tensor, subjects: Tensor, task: Tensor, explanation_inputs=None):
         self.subject_embed = self.subject_embed.to(subjects.device)
         if self.training:
-            predicts = self.training_process(src, subjects, task)
+            predicts = self.training_process(src, subjects, task, explanation_inputs=explanation_inputs)
         else:
-            predicts = self.inference(src, subjects, task)
+            predicts = self.inference(src, subjects, task, explanation_inputs=explanation_inputs)
 
         return predicts
 
-    def training_process(self, src, subjects, task):
+    def training_process(self, src, subjects, task, explanation_inputs=None):
         tgt_input = src.new_zeros((self.max_len, src.size(0), self.hidden_dim)) #Notice that this where we convert target input to zeros
         
         # tgt_input[0, :, :] = self.firstfix_linear(self.queryfix_embed[tgt[:, 0], tgt[:,1], :])
@@ -215,9 +254,42 @@ class gazeformer(nn.Module):
         # [N, T, H, W]
         predicts["action_map"] = aggr_action_map.view(-1, self.max_len, self.spatial_dim[0], self.spatial_dim[1])
 
+        if self.enable_explanation:
+            # `memory_task` is the personalized spatial memory returned by the
+            # transformer after subject/task integration.  Convert both
+            # boundary tensors once to the batch-first explanation contract.
+            predicts["decoder_states"] = outs.permute(1, 0, 2)
+            predicts["decoder_memory"] = memory_task.permute(1, 0, 2)
+            if self.explanation_module is None:
+                raise RuntimeError("Explanation is enabled but no explanation module was constructed")
+            if explanation_inputs is None:
+                raise ValueError(
+                    "Explanation is enabled for supervised training but no explanation_inputs were supplied. "
+                    "Provide normalized query/WHAT/WHY/HOW annotations."
+                )
+            query_text = explanation_inputs.get("query_text", explanation_inputs.get("query_texts"))
+            if query_text is None or "fixation_mask" not in explanation_inputs:
+                raise ValueError("explanation_inputs requires query_text and fixation_mask")
+            predicts["explanation"] = self.explanation_module(
+                decoder_states=predicts["decoder_states"],
+                decoder_memory=predicts["decoder_memory"],
+                action_logits=aggr_z,
+                duration_mu=t_log_normal_mu.permute(1, 0, 2).squeeze(2),
+                duration_param2=t_log_normal_sigma2.permute(1, 0, 2).squeeze(2),
+                query_text=query_text,
+                fixation_mask=explanation_inputs["fixation_mask"],
+                what_targets=explanation_inputs.get("what_texts", explanation_inputs.get("what_targets")),
+                why_membership=explanation_inputs.get("why_membership"),
+                why_text_targets=explanation_inputs.get("why_texts", explanation_inputs.get("why_text_targets")),
+                episode_count=explanation_inputs.get("episode_count"),
+                how_target=explanation_inputs.get("how_text", explanation_inputs.get("how_target")),
+                compute_generation=explanation_inputs.get("compute_generation", True),
+                compute_alignment=explanation_inputs.get("compute_alignment", True),
+            )
+
         return predicts
         
-    def inference(self, src, subjects, task):
+    def inference(self, src, subjects, task, explanation_inputs=None):
         tgt_input = src.new_zeros((self.max_len, src.size(0), self.hidden_dim)) #Notice that this where we convert target input to zeros
         
         # tgt_input[0, :, :] = self.firstfix_linear(self.queryfix_embed[tgt[:, 0], tgt[:,1], :])
@@ -257,5 +329,38 @@ class gazeformer(nn.Module):
         predicts['log_normal_sigma2'] = t_log_normal_sigma2.permute(1, 0, 2).squeeze(2)
         # [N, T, H, W]
         predicts["action_map"] = aggr_action_map.view(-1, self.max_len, self.spatial_dim[0], self.spatial_dim[1])
+
+        if self.enable_explanation:
+            predicts["decoder_states"] = outs.permute(1, 0, 2)
+            predicts["decoder_memory"] = memory_task.permute(1, 0, 2)
+            if (
+                getattr(self.args, "return_explanation_latents", False)
+                or getattr(self.args, "generate_explanations", False)
+            ):
+                if self.explanation_module is None:
+                    raise RuntimeError("Explanation is enabled but no explanation module was constructed")
+                if explanation_inputs is None:
+                    raise ValueError(
+                        "Explanation diagnostics require explicit raw query text in explanation_inputs"
+                    )
+                query_text = explanation_inputs.get("query_text", explanation_inputs.get("query_texts"))
+                fixation_mask = explanation_inputs.get(
+                    "fixation_mask",
+                    torch.ones(
+                        aggr_z.shape[:2], dtype=torch.bool, device=aggr_z.device
+                    ),
+                )
+                predicts["explanation"] = self.explanation_module(
+                    decoder_states=predicts["decoder_states"],
+                    decoder_memory=predicts["decoder_memory"],
+                    action_logits=aggr_z,
+                    duration_mu=t_log_normal_mu.permute(1, 0, 2).squeeze(2),
+                    duration_param2=t_log_normal_sigma2.permute(1, 0, 2).squeeze(2),
+                    query_text=query_text,
+                    fixation_mask=fixation_mask,
+                    compute_generation=False,
+                    compute_alignment=False,
+                    action_probabilities=True,
+                )
 
         return predicts

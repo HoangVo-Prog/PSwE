@@ -24,6 +24,7 @@ from models.sampling import Sampling
 
 from models.gazeformer import gazeformer
 from models.models import Transformer
+from models.explanation import load_model_state_with_explanation_migration
 
 from models.loss import CrossEntropyLoss, DurationSmoothL1Loss, MLPRayleighDistribution, MLPLogNormalDistribution, \
     LogAction, LogDuration, NSS, CC, KLD, CrossEntropyProbLoss
@@ -79,6 +80,20 @@ parser.add_argument("--fewshot_finetune_path", type=str, default="", help="pretr
 parser.add_argument("--subject_num", type=int, default=7, help="The number of the subject in OSIE")
 parser.add_argument("--adaptation", type=int, default=0, help="update user embedding based on loss")
 parser.add_argument("--random_support", type=int, default=2, help="random seed to choose support set")
+
+parser.add_argument("--enable_explanation", action="store_true", default=False)
+parser.add_argument("--explanation_annotations", type=str, default=None)
+parser.add_argument("--explanation_dim", type=int, default=256)
+parser.add_argument("--router_kmax", type=int, default=4)
+parser.add_argument("--how_hidden_dim", type=int, default=256)
+parser.add_argument("--semantic_encoder_name", type=str, default=None)
+parser.add_argument("--semantic_encoder_dim", type=int, default=None)
+parser.add_argument("--freeze_semantic_encoder", action="store_true", default=False)
+parser.add_argument("--explanation_llm_name", type=str, default=None)
+parser.add_argument("--explanation_llm_hidden_dim", type=int, default=None)
+parser.add_argument("--freeze_explanation_llm", action="store_true", default=False)
+parser.add_argument("--return_explanation_latents", action="store_true", default=False)
+parser.add_argument("--generate_explanations", action="store_true", default=False)
 args = parser.parse_args()
 
 
@@ -150,7 +165,9 @@ def main():
         if key == "optimizer":
             continue
         else:
-            model.load_state_dict(test_checkpoint[key])
+            load_model_state_with_explanation_migration(
+                model, test_checkpoint[key], explanation_enabled=args.enable_explanation
+            )
 
     # if len(args.gpu_ids) > 1:
     #     model = nn.DataParallel(model, args.gpu_ids)

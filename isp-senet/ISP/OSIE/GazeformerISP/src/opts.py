@@ -67,6 +67,44 @@ def parse_opt():
     parser.add_argument("--supervised_save", type=bool, default=False,
                         help="Copy the files before start the policy gradient update")
 
+    # Optional hierarchical explanation branch.  All defaults preserve the
+    # legacy predictor path; model/text construction is conditional on the
+    # feature switch.
+    parser.add_argument("--enable_explanation", action="store_true", default=False,
+                        help="Enable differentiable WHAT/WHY-R0/HOW-R0 supervision")
+    parser.add_argument("--explanation_annotations", type=str, default=None,
+                        help="Explicit explanation annotation JSON path (required when enabled for supervised training)")
+    parser.add_argument("--explanation_dim", type=int, default=256,
+                        help="Fixation/episode reasoning token dimension")
+    parser.add_argument("--router_kmax", type=int, default=4,
+                        help="Maximum WHY-R0 router slots")
+    parser.add_argument("--how_hidden_dim", type=int, default=256,
+                        help="HOW-R0 global token dimension")
+    parser.add_argument("--semantic_encoder_name", type=str, default=None,
+                        help="Configured RoBERTa-role semantic encoder name/path")
+    parser.add_argument("--semantic_encoder_dim", type=int, default=None,
+                        help="Semantic encoder output dimension when using an injected encoder")
+    parser.add_argument("--freeze_semantic_encoder", action="store_true", default=False,
+                        help="Freeze the configured semantic encoder")
+    parser.add_argument("--explanation_llm_name", type=str, default=None,
+                        help="Configured causal LLM name/path")
+    parser.add_argument("--explanation_llm_hidden_dim", type=int, default=None,
+                        help="Causal LLM hidden size when using an injected LLM")
+    parser.add_argument("--freeze_explanation_llm", action="store_true", default=False,
+                        help="Freeze the configured causal LLM")
+    parser.add_argument("--lambda_exp_what", type=float, default=1.0)
+    parser.add_argument("--lambda_exp_why", type=float, default=1.0)
+    parser.add_argument("--lambda_exp_how", type=float, default=1.0)
+    parser.add_argument("--lambda_what_txt", type=float, default=1.0)
+    parser.add_argument("--lambda_what_align", type=float, default=1.0)
+    parser.add_argument("--lambda_route", type=float, default=1.0)
+    parser.add_argument("--lambda_why_txt", type=float, default=1.0)
+    parser.add_argument("--lambda_why_align", type=float, default=1.0)
+    parser.add_argument("--lambda_how_txt", type=float, default=1.0)
+    parser.add_argument("--lambda_how_align", type=float, default=1.0)
+    parser.add_argument("--return_explanation_latents", action="store_true", default=False)
+    parser.add_argument("--generate_explanations", action="store_true", default=False)
+
     # config
     parser.add_argument('--cfg', type=str, default=None,
                         help='configuration; similar to what is used in detectron')
@@ -85,7 +123,9 @@ def parse_opt():
 
     # step 1: read cfg_fn
     args = parser.parse_args()
-    if args.cfg is not None or args.set_cfgs is not None:
+    # An empty default list is not a request to load the optional yacs config
+    # dependency; keep the baseline parser usable in minimal environments.
+    if args.cfg is not None or args.set_cfgs:
         from utils.config import CfgNode
         if args.cfg is not None:
             cn = CfgNode(CfgNode.load_yaml_with_base(args.cfg))

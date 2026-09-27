@@ -25,6 +25,7 @@ from models.sampling import Sampling
 
 from models.gazeformer import gazeformer
 from models.models import Transformer
+from models.explanation import load_model_state_with_explanation_migration
 
 parser = argparse.ArgumentParser(description="Scanpath prediction for images")
 parser.add_argument("--mode", type=str, default="test", help="Selecting running mode (default: test)")
@@ -75,6 +76,22 @@ parser.add_argument("--num_fewshot", type=int, default=10, help="number of image
 parser.add_argument("--fewshot_finetune_path", type=str, default="", help="pretrained model for few-shot learning")
 parser.add_argument("--subject_num", type=int, default=5, help="The number of the unseen subject in OSIE")
 parser.add_argument("--random_support", type=int, default=0, help="random seed to choose support set")
+
+# Explanation diagnostics are explicitly opt-in. Ordinary scanpath testing
+# does not construct or require any semantic/causal language model.
+parser.add_argument("--enable_explanation", action="store_true", default=False)
+parser.add_argument("--explanation_annotations", type=str, default=None)
+parser.add_argument("--explanation_dim", type=int, default=256)
+parser.add_argument("--router_kmax", type=int, default=4)
+parser.add_argument("--how_hidden_dim", type=int, default=256)
+parser.add_argument("--semantic_encoder_name", type=str, default=None)
+parser.add_argument("--semantic_encoder_dim", type=int, default=None)
+parser.add_argument("--freeze_semantic_encoder", action="store_true", default=False)
+parser.add_argument("--explanation_llm_name", type=str, default=None)
+parser.add_argument("--explanation_llm_hidden_dim", type=int, default=None)
+parser.add_argument("--freeze_explanation_llm", action="store_true", default=False)
+parser.add_argument("--return_explanation_latents", action="store_true", default=False)
+parser.add_argument("--generate_explanations", action="store_true", default=False)
 
 args = parser.parse_args()
 
@@ -145,7 +162,11 @@ def main():
             continue
         else:
             print(f'loading checkpoint from {checkpoints_dir}')
-            model.load_state_dict(test_checkpoint[key])
+            load_model_state_with_explanation_migration(
+                model,
+                test_checkpoint[key],
+                explanation_enabled=args.enable_explanation,
+            )
 
 
     if len(args.gpu_ids) > 1:

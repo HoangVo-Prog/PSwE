@@ -29,6 +29,7 @@ from models.sampling import Sampling
 
 from models.models import Transformer
 from models.gazeformer import gazeformer
+from models.explanation import load_model_state_with_explanation_migration, compose_joint_supervised_loss
 
 args = parse_opt()
 
@@ -178,7 +179,10 @@ def main():
             if key == "optimizer":
                 optimizer.load_state_dict(training_checkpoint[key])
             else:
-                model.load_state_dict(training_checkpoint[key])
+                load_model_state_with_explanation_migration(
+                    model, training_checkpoint[key], explanation_enabled=args.enable_explanation,
+                    logger=logger.info,
+                )
 
         del training_checkpoint
 
@@ -203,6 +207,22 @@ def main():
     if visible_gpus > 1:
         model = nn.DataParallel(model)
 
+    def build_explanation_inputs(batch, duration_masks):
+        if not args.enable_explanation:
+            return None
+        annotations = [annotation for sample in batch["explanation_annotations"] for annotation in sample]
+        if len(annotations) != duration_masks.shape[0]:
+            raise ValueError("Explanation annotations do not align with predictor batch")
+        return {
+            "query_text": [annotation["query_text"] for annotation in annotations],
+            "what_texts": [annotation["what_texts"] for annotation in annotations],
+            "why_membership": torch.stack([annotation["why_membership"] for annotation in annotations]).cuda(),
+            "why_texts": [annotation["why_texts"] for annotation in annotations],
+            "episode_count": torch.tensor([annotation["episode_count"] for annotation in annotations], dtype=torch.long).cuda(),
+            "how_text": [annotation["how_text"] for annotation in annotations],
+            "fixation_mask": duration_masks.bool(),
+        }
+
     def train(iteration, epoch):
         # traditional training stage
         if epoch < args.start_rl_epoch:
@@ -217,12 +237,15 @@ def main():
                     images, subjects, durations, action_masks, duration_masks, task_embeddings, target_scanpaths = tmp
                     # task = images.new_zeros((images.shape[0], args.lm_hidden_dim))
                     optimizer.zero_grad()
-                    predicts = model(src = images, subjects=subjects, task=task_embeddings)
+                    predicts = model(src=images, subjects=subjects, task=task_embeddings,
+                                     explanation_inputs=build_explanation_inputs(batch, duration_masks))
 
                     loss_actions = CrossEntropyLoss(predicts["actions"], target_scanpaths, action_masks)
                     loss_duration = MLPLogNormalDistribution(predicts["log_normal_mu"], predicts["log_normal_sigma2"],
                                                              durations, duration_masks)
-                    loss = loss_actions + args.lambda_1 * loss_duration
+                    scan_loss = loss_actions + args.lambda_1 * loss_duration
+                    loss_exp = predicts["explanation"]["loss_explanation"] if args.enable_explanation else scan_loss.new_zeros(())
+                    loss = compose_joint_supervised_loss(scan_loss, predicts.get("explanation") if args.enable_explanation else None)
 
                     loss.backward()
                     if args.clip > 0:
@@ -236,6 +259,12 @@ def main():
                     tensorboard_writer.add_scalar("loss/loss", loss, iteration)
                     tensorboard_writer.add_scalar("loss/loss_actions", loss_actions, iteration)
                     tensorboard_writer.add_scalar("loss/loss_duration", loss_duration, iteration)
+                    tensorboard_writer.add_scalar("loss/scan", scan_loss, iteration)
+                    if args.enable_explanation:
+                        explanation_output = predicts["explanation"]
+                        for name in ("loss_what_txt", "loss_what_align", "loss_route", "loss_why_txt", "loss_why_align", "loss_how_txt", "loss_how_align"):
+                            tensorboard_writer.add_scalar("loss/exp_" + name[5:], explanation_output[name], iteration)
+                        tensorboard_writer.add_scalar("loss/exp_weighted", loss_exp, iteration)
                     tensorboard_writer.add_scalar("learning_rate", optimizer.param_groups[0]["lr"], iteration)
 
         # reinforcement learning stage
