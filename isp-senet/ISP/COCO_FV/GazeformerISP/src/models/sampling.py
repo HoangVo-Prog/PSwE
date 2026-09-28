@@ -23,7 +23,7 @@ class Sampling():
         selected_actions_probs = \
             torch.gather(all_actions_prob, dim=2, index=selected_specific_actions.unsqueeze(-1)).squeeze(-1)
 
-        random_rand = torch.randn(log_normal_mu.shape).to(log_normal_mu.get_device())
+        random_rand = torch.randn(log_normal_mu.shape).to(log_normal_mu.device)
         duration_samples = torch.exp(random_rand * log_normal_sigma2 + log_normal_mu)
 
         scanpath_length = all_actions_prob.new_zeros(batch)

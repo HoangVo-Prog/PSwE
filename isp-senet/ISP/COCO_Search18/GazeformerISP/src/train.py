@@ -29,7 +29,7 @@ from models.sampling import Sampling
 
 from models.models import Transformer
 from models.gazeformer import gazeformer
-from models.explanation import load_model_state_with_explanation_migration, compose_joint_supervised_loss
+from models.explanation import restore_training_checkpoint, compose_joint_supervised_loss
 
 args = parse_opt()
 
@@ -181,14 +181,11 @@ def main():
         
     if args.resume_dir != "":
         training_checkpoint = torch.load(os.path.join(checkpoints_dir, "checkpoint.pth"))
-        for key in training_checkpoint:
-            if key == "optimizer":
-                optimizer.load_state_dict(training_checkpoint[key])
-            else:
-                load_model_state_with_explanation_migration(
-                    model, training_checkpoint[key], explanation_enabled=args.enable_explanation,
-                    logger=logger.info,
-                )
+        migrated = restore_training_checkpoint(
+            model, optimizer, training_checkpoint, args.enable_explanation, logger=logger.info)
+        if migrated:
+            start_epoch, iteration, best_metric = -1, -1, 0
+            checkpoint_manager = CheckpointManager(model, optimizer, checkpoints_dir, mode="max", best_metric=best_metric)
 
         del training_checkpoint
 

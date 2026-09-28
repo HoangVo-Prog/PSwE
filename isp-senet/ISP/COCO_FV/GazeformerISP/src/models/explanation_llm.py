@@ -59,6 +59,22 @@ class SemanticEncoderWrapper(nn.Module):
         if self.freeze:
             for parameter in self.encoder.parameters():
                 parameter.requires_grad_(False)
+            self.encoder.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:
+            self.encoder.eval()
+        return self
+
+    def encode_target(self, texts):
+        training = self.encoder.training
+        self.encoder.eval()
+        try:
+            with torch.no_grad():
+                return self.encode(texts).detach()
+        finally:
+            self.encoder.train(training and not self.freeze)
 
     def encode(self, texts: Sequence[str] | str) -> Tensor:
         texts = _as_text_list(texts)
@@ -123,6 +139,12 @@ class SharedExplanationLLM(nn.Module):
             tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
         self.llm = llm
         self.tokenizer = tokenizer
+        if tokenizer is not None and hasattr(tokenizer, "pad_token_id"):
+            if tokenizer.pad_token_id is None:
+                if getattr(tokenizer, "eos_token_id", None) is None:
+                    raise ValueError("Causal tokenizer requires a padding token or an EOS token")
+                tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "right"
         self.hidden_dim = _hidden_size(llm, hidden_dim)
         query_dim = int(query_dim or semantic_dim)
         self.branch_tokens = nn.ParameterDict({branch: nn.Parameter(torch.empty(self.hidden_dim)) for branch in self.BRANCHES})
@@ -138,6 +160,13 @@ class SharedExplanationLLM(nn.Module):
         if self.freeze:
             for parameter in self.llm.parameters():
                 parameter.requires_grad_(False)
+            self.llm.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:
+            self.llm.eval()
+        return self
 
     def _prefix(self, branch, query, latent):
         token = self.branch_tokens[branch].to(device=latent.device, dtype=latent.dtype).view(1, 1, -1).expand(latent.shape[0], -1, -1)

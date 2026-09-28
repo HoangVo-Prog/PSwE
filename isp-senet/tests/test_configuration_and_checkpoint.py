@@ -52,12 +52,6 @@ def test_joint_loss_adds_explanations_only_in_supervised_composition():
 
 
 def test_disabled_predictor_does_not_construct_explanation_module():
-    # The predictor's legacy models.py imports torchvision in the real
-    # environment.  Stub only that unrelated encoder symbol so this contract
-    # test stays CPU/offline and exercises the constructor gate itself.
-    stub = types.ModuleType("models.models")
-    stub.ResNetCOCO = nn.Module
-    sys.modules["models.models"] = stub
     from models.gazeformer import gazeformer
 
     class Transformer(nn.Module):

@@ -1,9 +1,11 @@
 
+import copy
 from torchvision import transforms
 import numpy as np
 from .utils import compute_search_cdf, preprocess_fixations, filter_scanpath, select_fewshot_subject
 from .utils import cutFixOnTarget
 from .data import  Siamese_Triplet_Gaze
+from .air_data import load_air_scanpaths, normalize_air_scanpaths
 
 
 def process_data(target_trajs,
@@ -22,6 +24,11 @@ def process_data(target_trajs,
     elif hparams.Data.name == 'COCO-Search18' or hparams.Data.name == 'COCO-Freeview':
         ori_h, ori_w = 320, 512
         rescale_flag = hparams.Data.im_h != ori_h
+    elif hparams.Data.name in ('Air-D', 'AiR', 'Air'):
+        # Air-D records are normalized before this shared path: each question
+        # keeps its raw-to-target coordinate scale and no center fixation is
+        # injected.  Do not apply the fixed OSIE/COCO dimensions again.
+        rescale_flag = False
     elif hparams.Data.name == 'MIT1003':
         rescale_flag = False # Use rescaled scanpaths
     elif hparams.Data.name == 'CAT2000':
@@ -57,8 +64,9 @@ def process_data(target_trajs,
                                 std=[0.229, 0.224, 0.225])
     ])
 
+    eval_split = getattr(hparams.Data, 'eval_split', 'test')
     valid_target_trajs = list(
-        filter(lambda x: x['split'] == 'test', target_trajs))
+        filter(lambda x: x['split'] == eval_split, target_trajs))
     
 
     is_coco_dataset = hparams.Data.name == 'COCO-Search18' or hparams.Data.name == 'COCO-Freeview'
@@ -80,6 +88,9 @@ def process_data(target_trajs,
     # training fixation data
     train_target_trajs = list(
         filter(lambda x: x['split'] == 'train', target_trajs))
+
+    if hparams.Data.name in ('Air-D', 'AiR', 'Air'):
+        train_target_trajs = copy.deepcopy(train_target_trajs)
 
     # fewshot_subject indicating subject ids for unseen subjects
     if hparams.Data.fewshot_subject[0] != -1:
@@ -115,9 +126,14 @@ def process_data(target_trajs,
 
     # validation fixation data
     valid_target_trajs = list(
-        filter(lambda x: x['split'] == 'test', target_trajs))
+        filter(lambda x: x['split'] == eval_split, target_trajs))
     
     
+    if hparams.Data.name in ('Air-D', 'AiR', 'Air') and hparams.Data.fewshot_subject[0] != -1:
+        subject_mapping = {subject: row for row, subject in enumerate(hparams.Data.fewshot_subject)}
+        valid_target_trajs = [dict(record, subject=subject_mapping[record['subject']])
+                              for record in valid_target_trajs if record['subject'] in subject_mapping]
+
     # print statistics
     traj_lens = list(map(lambda x: x['length'], valid_target_trajs))
     avg_traj_len, std_traj_len = np.mean(traj_lens), np.std(traj_lens)

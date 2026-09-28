@@ -694,7 +694,7 @@ class UserEmbeddingNet(nn.Module):
         dorsal_padding = torch.zeros(bs, dorsal_embs.size(0),device=dorsal_embs.device).bool()
         ventral_padding = tgt_padding_mask
 
-        if self.ntask != 1:
+        if self.ntask != 1 or self.pa.name in ("Air-D", "AiR", "Air"):
             task_emb = self.task_transform(task_emb).unsqueeze(0)
             dorsal_embs = torch.cat((task_emb, dorsal_embs), dim=0)
             dorsal_padding = torch.cat((torch.zeros(bs, 1, device=dorsal_embs.device), dorsal_padding), dim=1)
@@ -756,4 +756,3 @@ class UserEmbeddingNet(nn.Module):
         out["pred_subject_id"] = pred_subject_id
         out['user_emb'] = cls_token
         return out
-    

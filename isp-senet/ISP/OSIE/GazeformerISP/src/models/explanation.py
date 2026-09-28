@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from numbers import Integral
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
@@ -204,12 +205,14 @@ class WhyR0Router(nn.Module):
             nn.Linear(hidden_dim, self.kmax),
         )
 
-    def forward(self, z: Tensor, query: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, z: Tensor, query: Tensor, fixation_mask: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
         batch, length, _ = z.shape
         if length > self.max_length:
             raise ValueError(f"sequence length {length} exceeds router max_length {self.max_length}")
         positions = torch.arange(length, device=z.device).unsqueeze(0).expand(batch, -1)
-        normalized_time = positions.to(z.dtype) / float(max(length - 1, 1))
+        lengths = (fixation_mask.sum(-1) if fixation_mask is not None
+                   else torch.full((batch,), length, device=z.device))
+        normalized_time = positions.to(z.dtype) / (lengths - 1).clamp_min(1).to(z.dtype).unsqueeze(-1)
         temporal = z.new_zeros((batch, length, self.temporal_dim))
         temporal[..., 0::2] = torch.sin(normalized_time.unsqueeze(-1) * self.temporal_frequency[: temporal[..., 0::2].shape[-1]])
         temporal[..., 1::2] = torch.cos(normalized_time.unsqueeze(-1) * self.temporal_frequency[: temporal[..., 1::2].shape[-1]])
@@ -232,6 +235,8 @@ class WhyR0Router(nn.Module):
         if mask.sum() == 0:
             return router_prob.sum() * 0.0
         target = why_membership.to(device=router_prob.device, dtype=router_prob.dtype)
+        if not torch.all((target == 0) | (target == 1)):
+            raise ValueError("Gold WHY membership must be one-hot")
         if torch.any(target[mask.bool()].sum(dim=-1).sub(1.0).abs() > 1e-4):
             raise ValueError("Each real fixation must belong to exactly one gold WHY episode")
         if torch.any(target[~mask.bool()].abs() > 1e-6):
@@ -403,7 +408,7 @@ class HierarchicalExplanationModule(nn.Module):
     def _alignment_for_texts(self, projected: Tensor, texts: Sequence[str], device: torch.device) -> Tensor:
         if not texts:
             return _zero(projected)
-        target = self.semantic_encoder.encode(list(texts)).to(device=device, dtype=projected.dtype)
+        target = self.semantic_encoder.encode_target(list(texts)).to(device=device, dtype=projected.dtype)
         return cosine_alignment_loss(projected, target)
 
     def forward(
@@ -442,7 +447,7 @@ class HierarchicalExplanationModule(nn.Module):
             action_probabilities=action_probabilities,
         )
         z = fixation["z"]
-        router_logits, router_prob = self.why_router(z, query)
+        router_logits, router_prob = self.why_router(z, query, fixation_mask)
         if why_membership is None:
             membership = torch.zeros_like(router_prob)
             route_loss = _zero(z)
@@ -454,8 +459,15 @@ class HierarchicalExplanationModule(nn.Module):
                 )
             route_loss = self.why_router.routing_loss(router_prob, membership, fixation_mask)
         episode_tokens, episode_mass = self.why_router.soft_episode_aggregation(z, router_prob, fixation_mask)
-        if episode_count is None and why_membership is not None:
-            episode_count = (membership.sum(dim=1) > 0).sum(dim=-1).long()
+        if why_membership is not None:
+            active = membership.sum(dim=1) > 0
+            counts = active.sum(dim=-1).long()
+            expected = torch.arange(self.kmax, device=z.device).unsqueeze(0) < counts.unsqueeze(-1)
+            if not torch.equal(active, expected):
+                raise ValueError("Gold WHY membership must use contiguous active slots from zero")
+            if episode_count is not None and not torch.equal(torch.as_tensor(episode_count, device=z.device).long(), counts):
+                raise ValueError("episode_count disagrees with gold WHY membership")
+            episode_count = counts
         how = None
         if episode_count is not None:
             how = self.how_aggregator(episode_tokens, query, episode_count)
@@ -495,7 +507,7 @@ class HierarchicalExplanationModule(nn.Module):
                 (sample, slot)
                 for sample in range(batch)
                 for slot in range(self.kmax)
-                if slot < int(torch.as_tensor(episode_count)[sample].item()) and bool(why_rows[sample][slot].strip())
+                if bool(how["active_episode_mask"][sample, slot]) and bool(why_rows[sample][slot].strip())
             ]
             if active_why:
                 why_latents = torch.stack([episode_tokens[sample, slot] for sample, slot in active_why])
@@ -509,7 +521,7 @@ class HierarchicalExplanationModule(nn.Module):
         loss_how_txt = _zero(z)
         loss_how_align = _zero(z)
         if how is not None:
-            active_how = [index for index, text in enumerate(how_rows) if text.strip()]
+            active_how = [index for index, text in enumerate(how_rows) if text.strip() and bool(how["active_episode_mask"][index].any())]
             if active_how:
                 how_latents = how["global_token"][active_how]
                 how_query = query[active_how]
@@ -554,60 +566,294 @@ class HierarchicalExplanationModule(nn.Module):
         }
 
 
-def normalize_explanation_annotation(raw: Mapping[str, Any], max_length: int, kmax: int) -> dict[str, Any]:
-    """Normalize one source annotation to the predictor's padded contract."""
+def _annotation_identity(raw: Mapping[str, Any]) -> str:
+    """Return enough sample identity to make malformed-data errors actionable."""
+
+    return (
+        f"dataset={raw.get('dataset', '<unknown>')!r}, "
+        f"name={raw.get('name', raw.get('image_id', '<unnamed>'))!r}, "
+        f"subject={raw.get('subject', raw.get('subject_idx', '<unknown>'))!r}"
+    )
+
+
+def _fixation_id(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"Fixation/episode index must be an integer, got {value!r}")
+    return int(value)
+
+
+def _required_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a nonempty string")
+    return value
+
+
+def _inline_query_text(raw: Mapping[str, Any]) -> str:
+    for key in ("question", "query_text", "task_text", "task"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise ValueError(f"Augmented explanation sample ({_annotation_identity(raw)}) has no task/question text")
+
+
+def _validate_inline_annotation(raw: Mapping[str, Any]) -> tuple[str, list[str], list[tuple[list[int], str]], str]:
+    """Validate the raw augmented format before any model-side truncation."""
+
+    identity = _annotation_identity(raw)
+    try:
+        x = list(raw["X"])
+        y = list(raw["Y"])
+        t = list(raw["T"])
+    except KeyError as exc:
+        raise ValueError(f"Augmented explanation sample ({identity}) is missing raw field {exc.args[0]!r}") from exc
+    if not (len(x) == len(y) == len(t)):
+        raise ValueError(
+            f"Augmented explanation sample ({identity}) violates len(X)==len(Y)==len(T): "
+            f"{len(x)}, {len(y)}, {len(t)}"
+        )
+    if not x:
+        raise ValueError(f"Augmented explanation sample ({identity}) has a zero-length scanpath")
+    prediction = raw.get("prediction")
+    if not isinstance(prediction, Mapping):
+        raise ValueError(f"Augmented explanation sample ({identity}) has no object-valued prediction field")
+
+    what_entries = prediction.get("fixations")
+    if not isinstance(what_entries, list):
+        raise ValueError(f"Augmented explanation sample ({identity}) prediction.fixations must be a list")
+    what_ids = []
+    what_texts_by_id: dict[int, str] = {}
+    for entry_index, entry in enumerate(what_entries):
+        if not isinstance(entry, Mapping) or "fixation" not in entry or "what" not in entry:
+            raise ValueError(
+                f"Augmented explanation sample ({identity}) prediction.fixations[{entry_index}] "
+                "must contain fixation and what"
+            )
+        try:
+            fixation_id = _fixation_id(entry["fixation"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Augmented explanation sample ({identity}) prediction.fixations[{entry_index}].fixation "
+                f"is not an integer: {entry.get('fixation')!r}"
+            ) from exc
+        what_ids.append(fixation_id)
+        what_texts_by_id[fixation_id] = _required_text(entry["what"], f"{identity} WHAT {fixation_id}")
+    expected_ids = list(range(1, len(x) + 1))
+    if len(what_entries) != len(x) or what_ids != expected_ids:
+        raise ValueError(
+            f"Augmented explanation sample ({identity}) prediction.fixations IDs must be exactly "
+            f"1..{len(x)} in order; got {what_ids!r}"
+        )
+
+    regions = prediction.get("regions")
+    if not isinstance(regions, list):
+        raise ValueError(f"Augmented explanation sample ({identity}) prediction.regions must be a list")
+    parsed_regions: list[tuple[list[int], str]] = []
+    covered: list[int] = []
+    for region_index, region in enumerate(regions):
+        if not isinstance(region, Mapping) or "fixations" not in region or "why" not in region:
+            raise ValueError(
+                f"Augmented explanation sample ({identity}) prediction.regions[{region_index}] "
+                "must contain fixations and why"
+            )
+        ids = list(region["fixations"])
+        if not ids:
+            raise ValueError(f"Augmented explanation sample ({identity}) prediction.regions[{region_index}] is empty")
+        parsed_ids: list[int] = []
+        for id_index, value in enumerate(ids):
+            try:
+                fixation_id = _fixation_id(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Augmented explanation sample ({identity}) prediction.regions[{region_index}].fixations"
+                    f"[{id_index}] is not an integer: {value!r}"
+                ) from exc
+            if not 1 <= fixation_id <= len(x):
+                raise ValueError(
+                    f"Augmented explanation sample ({identity}) prediction.regions[{region_index}] references "
+                    f"raw fixation {fixation_id}; valid range is 1..{len(x)}"
+                )
+            if fixation_id in parsed_ids:
+                raise ValueError(
+                    f"Augmented explanation sample ({identity}) prediction.regions[{region_index}] repeats "
+                    f"raw fixation {fixation_id}"
+                )
+            parsed_ids.append(fixation_id)
+            covered.append(fixation_id)
+        parsed_regions.append((parsed_ids, _required_text(region["why"], f"{identity} WHY {region_index}")))
+    if sorted(covered) != expected_ids:
+        raise ValueError(
+            f"Augmented explanation sample ({identity}) WHY regions must partition raw fixation IDs "
+            f"1..{len(x)} exactly once; got {covered!r}"
+        )
+    parsed_regions.sort(key=lambda region: min(region[0]))
+    if "how" not in prediction:
+        raise ValueError(f"Augmented explanation sample ({identity}) prediction is missing how")
+    return _inline_query_text(raw), [what_texts_by_id[i] for i in expected_ids], parsed_regions, _required_text(prediction["how"], f"{identity} HOW")
+
+
+def _normalise_model_indices(
+    raw_length: int,
+    max_length: int,
+    model_raw_indices: Optional[Sequence[int]] = None,
+    raw_to_model_idx: Optional[Mapping[int, int]] = None,
+) -> tuple[list[int], dict[int, int]]:
+    """Validate the preprocessing-produced 1-based raw -> 0-based model map."""
+
+    if raw_to_model_idx is not None and model_raw_indices is not None:
+        raise ValueError("Pass either model_raw_indices or raw_to_model_idx, not both")
+    if max_length <= 0:
+        raise ValueError("max_length must be positive")
+    if raw_to_model_idx is not None:
+        pairs = [(_fixation_id(raw_id), _fixation_id(token)) for raw_id, token in raw_to_model_idx.items()]
+        pairs.sort(key=lambda item: item[1])
+        if [token for _, token in pairs] != list(range(len(pairs))):
+            raise ValueError("raw-to-model mapping must have contiguous model indices from zero")
+        indices = [raw_id for raw_id, _ in pairs]
+    elif model_raw_indices is None:
+        indices = list(range(1, min(raw_length, max_length) + 1))
+        mapping = {raw_id: token for token, raw_id in enumerate(indices)}
+    else:
+        indices = [_fixation_id(value) for value in model_raw_indices]
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"raw-to-model mapping contains duplicate raw IDs: {indices!r}")
+    if indices != sorted(indices):
+        raise ValueError("raw-to-model mapping must preserve temporal fixation order")
+    if any(raw_id < 1 or raw_id > raw_length for raw_id in indices):
+        raise ValueError(f"raw-to-model mapping contains an out-of-range raw fixation: {indices!r}")
+    indices = indices[:max_length]
+    mapping = {raw_id: token for token, raw_id in enumerate(indices)}
+    if list(mapping.values()) != list(range(len(mapping))):
+        raise ValueError(f"raw-to-model mapping must have contiguous model indices from zero: {mapping!r}")
+    return indices, mapping
+
+
+def normalize_augmented_explanation_annotation(
+    raw: Mapping[str, Any],
+    max_length: int,
+    kmax: int,
+    model_raw_indices: Optional[Sequence[int]] = None,
+    raw_to_model_idx: Optional[Mapping[int, int]] = None,
+    allow_truncated_how: bool = False,
+) -> dict[str, Any]:
+    """Normalize an inline augmented benchmark record without positional guessing."""
+
+    query_text, raw_what, raw_regions, how_text = _validate_inline_annotation(raw)
+    return _align_explanation_targets(raw, query_text, raw_what, raw_regions, how_text,
+                                      max_length, kmax, model_raw_indices, raw_to_model_idx,
+                                      allow_truncated_how)
+
+
+def _align_explanation_targets(raw, query_text, raw_what, raw_regions, how_text,
+                               max_length, kmax, model_raw_indices, raw_to_model_idx,
+                               allow_truncated_how):
+    raw_length = len(raw_what)
+    if kmax <= 0:
+        raise ValueError("Kmax must be positive")
+    kept_raw_ids, mapping = _normalise_model_indices(
+        raw_length, max_length, model_raw_indices=model_raw_indices, raw_to_model_idx=raw_to_model_idx
+    )
+    truncated = len(kept_raw_ids) != raw_length
+    if not kept_raw_ids:
+        raise ValueError("Explanation supervision requires at least one model-visible fixation")
+    if truncated and how_text.strip() and not allow_truncated_how:
+        raise ValueError(
+            f"Augmented explanation sample ({_annotation_identity(raw)}) has a HOW target for a raw trajectory "
+            "that is truncated by preprocessing. Set allow_truncated_how=True only when that target is known "
+            "to describe the model-visible trajectory."
+        )
+
+    membership = torch.zeros((max_length, kmax), dtype=torch.float32)
+    what_texts = [""] * max_length
+    for raw_id in kept_raw_ids:
+        what_texts[mapping[raw_id]] = raw_what[raw_id - 1]
+
+    active_regions: list[tuple[list[int], str]] = []
+    for raw_ids, why_text in raw_regions:
+        surviving = [raw_id for raw_id in raw_ids if raw_id in mapping]
+        if not surviving:
+            continue
+        active_regions.append((surviving, why_text))
+    active_regions.sort(key=lambda region: min(mapping[raw_id] for raw_id in region[0]))
+    if len(active_regions) > kmax:
+        raise ValueError(
+            f"Augmented explanation sample ({_annotation_identity(raw)}) has {len(active_regions)} surviving WHY "
+            f"episodes, exceeding Kmax={kmax}"
+        )
+    why_texts = [""] * kmax
+    for slot, (raw_ids, why_text) in enumerate(active_regions):
+        why_texts[slot] = why_text
+        for raw_id in raw_ids:
+            membership[mapping[raw_id], slot] = 1.0
+    return {
+        "query_text": query_text,
+        "what_texts": what_texts,
+        "why_membership": membership,
+        "episode_count": len(active_regions),
+        "why_texts": why_texts,
+        "how_text": how_text if (not truncated or allow_truncated_how) else "",
+        "raw_to_model_idx": mapping,
+        "model_raw_indices": kept_raw_ids,
+        "raw_length": raw_length,
+        "how_truncated": truncated,
+    }
+
+
+def normalize_explanation_annotation(
+    raw: Mapping[str, Any],
+    max_length: int,
+    kmax: int,
+    model_raw_indices: Optional[Sequence[int]] = None,
+    raw_to_model_idx: Optional[Mapping[int, int]] = None,
+    allow_truncated_how: bool = False,
+) -> dict[str, Any]:
+    """Normalize inline augmented data, retaining the historical normalized form."""
+
+    if "prediction" in raw or "X" in raw or "Y" in raw or "T" in raw:
+        return normalize_augmented_explanation_annotation(
+            raw,
+            max_length=max_length,
+            kmax=kmax,
+            model_raw_indices=model_raw_indices,
+            raw_to_model_idx=raw_to_model_idx,
+            allow_truncated_how=allow_truncated_how,
+        )
 
     required = ("query_text", "what_texts", "why_texts", "how_text")
     missing = [key for key in required if key not in raw]
     if missing:
         raise ValueError(f"Explanation annotation is missing required fields: {', '.join(missing)}")
-    query_text = str(raw["query_text"])
-    what_source = [str(value) for value in raw["what_texts"]]
+    query_text = _required_text(raw["query_text"], "query_text")
+    what_source = [_required_text(value, "WHAT") for value in raw["what_texts"]]
+    why_texts = list(raw["why_texts"])
+    how_text = _required_text(raw["how_text"], "HOW")
+    if not what_source:
+        raise ValueError("Explanation annotation has a zero-length scanpath")
     if "why_membership" in raw:
-        membership_source = torch.as_tensor(raw["why_membership"], dtype=torch.float32)
-        if membership_source.ndim != 2:
-            raise ValueError("why_membership must be rank 2")
-        if torch.any((membership_source.sum(dim=-1) - 1.0).abs() > 1e-4):
+        membership = torch.as_tensor(raw["why_membership"], dtype=torch.float32)
+        if membership.ndim != 2 or membership.shape[0] != len(what_source):
+            raise ValueError("why_membership must cover the same real fixations as WHAT")
+        if not torch.all((membership == 0) | (membership == 1)) or not torch.all(membership.sum(-1) == 1):
             raise ValueError("Each real fixation must have exactly one gold WHY episode")
-        episode_count = int((membership_source.sum(dim=0) > 0).sum().item())
-        if membership_source.shape[1] > kmax:
-            raise ValueError(f"Gold WHY episode count exceeds Kmax={kmax}")
-        why_ids = membership_source.argmax(dim=-1).tolist()
+        why_ids = membership.argmax(-1).tolist()
+        active_ids = list(dict.fromkeys(why_ids))
+        if len(why_texts) != membership.shape[1]:
+            raise ValueError("why_texts must be indexed by membership column")
+        text_by_id = dict(enumerate(why_texts))
     else:
         if "why_episode_ids" not in raw:
             raise ValueError("Explanation annotation requires why_episode_ids or why_membership")
-        why_ids_source = [int(value) for value in raw["why_episode_ids"]]
-        ordered_ids: list[int] = []
-        for episode_id in why_ids_source:
-            if episode_id >= 0 and episode_id not in ordered_ids:
-                ordered_ids.append(episode_id)
-        if len(ordered_ids) > kmax:
-            raise ValueError(f"Gold WHY episode count exceeds Kmax={kmax}")
-        remap = {episode_id: index for index, episode_id in enumerate(ordered_ids)}
-        why_ids = [remap.get(episode_id, -1) for episode_id in why_ids_source]
-        episode_count = len(ordered_ids)
-    if len(what_source) != len(why_ids):
-        raise ValueError("what_texts and WHY membership must cover the same real fixations")
-    if len(what_source) > max_length:
-        what_source = what_source[:max_length]
-        why_ids = why_ids[:max_length]
-    membership = torch.zeros((max_length, kmax), dtype=torch.float32)
-    for timestep, episode_id in enumerate(why_ids):
-        if episode_id < 0:
-            continue
-        if episode_id >= kmax:
-            raise ValueError(f"WHY episode id {episode_id} is outside Kmax={kmax}")
-        membership[timestep, episode_id] = 1.0
-    why_text_source = [str(value) for value in raw["why_texts"]]
-    why_texts = [why_text_source[index] if index < len(why_text_source) else "" for index in range(kmax)]
-    return {
-        "query_text": query_text,
-        "what_texts": what_source + [""] * (max_length - len(what_source)),
-        "why_membership": membership,
-        "episode_count": episode_count,
-        "why_texts": why_texts,
-        "how_text": str(raw["how_text"]),
-    }
+        why_ids = [_fixation_id(value) for value in raw["why_episode_ids"]]
+        if len(why_ids) != len(what_source) or any(value < 0 for value in why_ids):
+            raise ValueError("Each real fixation must have exactly one gold WHY episode")
+        active_ids = list(dict.fromkeys(why_ids))
+        if len(why_texts) != len(active_ids):
+            raise ValueError("why_texts must match episodes in first-occurrence order")
+        text_by_id = dict(zip(active_ids, why_texts))
+    regions = [([step + 1 for step, value in enumerate(why_ids) if value == episode],
+                _required_text(text_by_id[episode], "WHY")) for episode in active_ids]
+    return _align_explanation_targets(raw, query_text, what_source, regions, how_text,
+                                      max_length, kmax, model_raw_indices, raw_to_model_idx,
+                                      allow_truncated_how)
 
 
 def load_explanation_annotations(path: str | Path) -> Any:
@@ -620,35 +866,36 @@ def load_explanation_annotations(path: str | Path) -> Any:
 def lookup_explanation_annotation(payload: Any, fixation: Mapping[str, Any]) -> Mapping[str, Any]:
     """Find an annotation by an explicit record id or image/subject identity."""
 
+    if "prediction" in fixation:
+        return fixation
     if all(key in fixation for key in ("query_text", "what_texts", "how_text")):
         return fixation
     records = payload.get("annotations", payload) if isinstance(payload, Mapping) else payload
-    candidates = []
+    explicit_id = fixation.get("sample_id", fixation.get("id"))
     if isinstance(records, Mapping):
-        for key in ("id", "sample_id", "name"):
-            if key in fixation:
-                value = records.get(str(fixation[key]), records.get(fixation[key]))
-                if value is not None:
-                    candidates.append(value)
-        if candidates:
-            return candidates[0]
-        raise KeyError(
-            f"No explanation annotation matched fixation keys for {fixation.get('name', '<unnamed>')!r}"
-        )
-    if isinstance(records, list):
-        for record in records:
-            if not isinstance(record, Mapping):
-                continue
-            if "id" in fixation and record.get("id") == fixation.get("id"):
-                return record
-            if record.get("name") == fixation.get("name") and (
-                "subject" not in record or record.get("subject") == fixation.get("subject")
-            ):
-                return record
-    raise KeyError(
-        f"No explanation annotation matched fixation {fixation.get('name', '<unnamed>')!r}; "
-        "provide an explicit annotation record id/name mapping."
-    )
+        keyed = records.get(str(explicit_id), records.get(explicit_id)) if explicit_id is not None else None
+        if keyed is not None:
+            records = [dict(keyed, sample_id=explicit_id)]
+        else:
+            records = list(records.values())
+    if not isinstance(records, list):
+        raise KeyError(f"No explanation annotation for {_annotation_identity(fixation)}")
+    def identity(record):
+        return (record.get("name", record.get("image_id")),
+                record.get("explanation_source_subject", record.get("subject_idx", record.get("subject"))),
+                record.get("question_id", record.get("task")), record.get("condition"))
+    matches = [record for record in records if isinstance(record, Mapping) and (
+        record.get("sample_id", record.get("id")) == explicit_id if explicit_id is not None
+        else identity(record) == identity(fixation))]
+    if len(matches) != 1:
+        raise ValueError(f"Expected one explanation annotation for {_annotation_identity(fixation)}, found {len(matches)}")
+    annotation = matches[0]
+    for field in ("X", "Y", "T"):
+        if field in annotation and field in fixation and list(annotation[field]) != list(fixation[field]):
+            raise ValueError(f"Sidecar {field} differs from raw scanpath for {_annotation_identity(fixation)}")
+    if "what_texts" in annotation and len(annotation["what_texts"]) != len(fixation["X"]):
+        raise ValueError("Sidecar WHAT count does not match the raw scanpath")
+    return annotation
 
 
 def load_model_state_with_explanation_migration(
@@ -664,23 +911,30 @@ def load_model_state_with_explanation_migration(
     ``strict=False``.
     """
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    explanation_prefix = "explanation_module."
-    allowed_missing = [key for key in missing if key.startswith(explanation_prefix)]
-    allowed_unexpected = [key for key in unexpected if key.startswith(explanation_prefix)]
-    unrelated_missing = [key for key in missing if key not in allowed_missing]
-    unrelated_unexpected = [key for key in unexpected if key not in allowed_unexpected]
-    logger(
-        "checkpoint migration: explanation_enabled={}, missing_keys={}, unexpected_keys={}".format(
-            explanation_enabled, missing, unexpected
-        )
-    )
-    if unrelated_missing or unrelated_unexpected:
-        raise RuntimeError(
-            "Checkpoint incompatibility outside explanation keys: "
-            f"missing={unrelated_missing}, unexpected={unrelated_unexpected}"
-        )
-    if allowed_missing:
+    expected = set(model.state_dict())
+    supplied = set(state_dict)
+    prefix = "explanation_module."
+    missing = sorted(expected - supplied)
+    unexpected = sorted(supplied - expected)
+    fresh = explanation_enabled and not any(key.startswith(prefix) for key in supplied)
+    unrelated = [key for key in missing if not (fresh and key.startswith(prefix))]
+    unrelated += [key for key in unexpected if not (not explanation_enabled and key.startswith(prefix))]
+    logger(f"checkpoint migration: explanation_enabled={explanation_enabled}, missing_keys={missing}, unexpected_keys={unexpected}")
+    if unrelated:
+        raise RuntimeError(f"Checkpoint incompatibility outside explanation keys or partial explanation checkpoint: {unrelated}")
+    result = model.load_state_dict(state_dict, strict=False)
+    if fresh and missing:
         logger("checkpoint migration: explanation parameters freshly initialized")
-    return missing, unexpected
+    return result
 
+
+def restore_training_checkpoint(model, optimizer, checkpoint, explanation_enabled, logger=print):
+    missing, unexpected = load_model_state_with_explanation_migration(
+        model, checkpoint["model"], explanation_enabled, logger=logger)
+    migrated = bool(missing or unexpected)
+    if migrated:
+        optimizer.state.clear()
+        logger("checkpoint migration: optimizer and schedule reset for changed parameter set")
+    elif "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    return migrated

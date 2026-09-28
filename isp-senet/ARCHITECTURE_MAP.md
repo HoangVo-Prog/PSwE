@@ -1,5 +1,9 @@
 # LLM Explanation Module — Codex Implementation Map
 
+> Current verification and corrections: see the September 28, 2026 addendum
+> at the end and `audit/AUDIT_REPORT.md`. Historical sections are not a pass claim.
+
+
 > **Purpose**
 >
 > This file maps `architecture.md` onto the current `isp-senet/**` implementation described by `CODEBASE_MAP.md`.
@@ -73,7 +77,8 @@ S = SE-Net
 O = ISP/OSIE/GazeformerISP/src
 F = ISP/COCO_FV/GazeformerISP/src
 C = ISP/COCO_Search18/GazeformerISP/src
-P = the corresponding O/F/C predictor copy
+A = ISP/AiR/GazeformerISP/src
+P = the corresponding O/F/C/A predictor copy
 ```
 
 The LLM explanation module belongs to the **predictor side**, not the offline SE-Net export side.
@@ -561,9 +566,11 @@ It is acceptable to precompute/freeze RoBERTa target/query embeddings later, but
 
 # 9. Explanation Annotation Contract
 
-The current predictor dataset does not provide the explanation targets required by the architecture.
-
-Add explicit fields to each training example.
+The active datasets accept the benchmark sample augmented with an inline
+`prediction` object. The loader validates the raw source fields before
+normalizing them to the padded model contract. A legacy normalized sidecar is
+still accepted for older artifacts, but it is not the source format for new
+data.
 
 Minimum semantic schema:
 
@@ -580,9 +587,28 @@ Minimum semantic schema:
     "how_text": str,
 
     # query text for explanation semantic encoder
-    "explanation_query_text": str,
+    "query_text": str,
 }
 ```
+
+The source-format contract is:
+
+```json
+{
+  "name": "...", "subject": 1, "task": "...", "condition": "...",
+  "X": [], "Y": [], "T": [], "answer": "...",
+  "prediction": {
+    "fixations": [{"fixation": 1, "what": "..."}],
+    "regions": [{"fixations": [1], "why": "..."}],
+    "how": "..."
+  }
+}
+```
+
+WHAT/WHY IDs are 1-based raw fixation IDs. The active loader validates the
+`X/Y/T` lengths, exact WHAT ID sequence, WHY bounds, and exact WHY partition;
+it then applies the preprocessing-produced raw-to-model mapping before
+padding. Mapping is never reconstructed from floating-point coordinates.
 
 Alternative accepted storage:
 
@@ -1214,7 +1240,9 @@ Primary files:
 P/dataset/dataset.py
 ```
 
-for O/F/C.
+for O/F/C/A. O is the canonical implementation; F/C import that implementation
+through small local adapters, and A reuses the same model/language contracts
+with AiR-specific data loading.
 
 Add explanation annotation loading to the active dataset classes used by supervised training.
 
@@ -2137,3 +2165,44 @@ Most relevant `architecture.md` sections:
 27-28  Joint Objective and Gradient Flow
 29     Compact Notation Index
 ```
+
+## September 28, 2026 audit/remediation addendum
+
+The earlier mapping sections describe the baseline and implementation plan, not
+runtime verification. `audit/AUDIT_REPORT.md`, `audit/FINDINGS.md`, and
+`audit/TEST_RESULTS.md` record the inspected worktree, repairs, executed tests,
+and external verification blockers. No deployment rule for the R0 episode count
+or interpretation of the baseline duration distribution has been invented.
+
+- The canonical explanation implementation remains O; F/C retain local language
+  wrappers and predictor/data differences. AiR reuses the local predictor math.
+- Both augmented and legacy annotations use the same explicit raw-to-model map.
+  Surviving episode slots are reordered by their first **model-visible** fixation.
+  Truncated HOW requires an explicit, semantically justified override; no text is
+  silently rewritten. Malformed IDs, partitions, empty labels, and zero-length
+  trajectories fail instead of being repaired. Sidecars require a unique explicit
+  sample ID or the full image/subject/task-or-question/condition identity.
+- Temporal normalization uses each example's real fixation count, not padded L.
+  Frozen encoders/LLMs stay in eval mode. Gold semantic targets are deterministic
+  and detached even when the query encoder is trainable; the frozen LLM still
+  propagates gradients through its prefix inputs. Tokenizers use right padding,
+  and a missing pad token reuses EOS only when EOS exists.
+- Migration accepts a wholly base checkpoint into the explanation model, not a
+  partially missing explanation checkpoint. Parameter-set migration resets the
+  optimizer/schedule; same-model resume restores optimizer state. Ordinary
+  inference can discard reported explanation keys without instantiating text models.
+- CLI generation/latent flags now fail early with an explanation of the unresolved
+  inference contract. Programmatic latent diagnostics remain available with an
+  explicit query and fixation mask; they do not fabricate WHY/HOW active slots.
+- Air-D now has supervised/RL stages, reference metric wiring, validation,
+  checkpoint saving/resume, and checkpoint-backed serialized predictions.
+  `ISP/AiR/GazeformerISP/README.md` documents its commands and prerequisites.
+- Air-D SE-Net exports optional `<table>.subjects.json` metadata containing source
+  subject IDs in row order. The Air-D predictor consumes it for remapped/subset
+  tables. Full legacy tables continue to use raw zero-based subject_idx rows.
+  Few-shot export retains the pretrained classifier size, averages available
+  support embeddings, and does not report an unseen-subject classifier score.
+- O/F/C coordinate conventions, scanpath losses, duration ambiguity, RL objective,
+  query-position initialization, subject-table boundary, and evaluation grouping
+  remain unchanged. The sampler's random tensor now follows the input device,
+  enabling CPU checks without altering its distribution.

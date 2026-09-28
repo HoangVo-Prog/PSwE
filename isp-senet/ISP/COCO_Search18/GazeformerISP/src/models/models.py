@@ -1,5 +1,3 @@
-from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
-import torchvision.transforms as T
 import copy
 from typing import Optional
 
@@ -11,6 +9,7 @@ from torch import nn, Tensor
 class ResNetCOCO(nn.Module):
     def __init__(self, device = "cuda:0"):
         super(ResNetCOCO, self).__init__()
+        from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
         self.resnet = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.COCO_V1).backbone.body.to(device)
         self.device = device
         

@@ -1,3 +1,4 @@
+from common.air_data import save_subject_embeddings
 import sys
 sys.path.append('../common')
 import time
@@ -20,7 +21,8 @@ def evaluate_user_siamese(
     
     start_time = time.time()
     model.eval()
-    num_subjects = hparams.Data.num_subjects
+    is_air = hparams.Data.name in ("Air-D", "AiR", "Air")
+    num_subjects = len(hparams.Data.subject_ids) if is_air else hparams.Data.num_subjects
     
     correct_predictions_per_class_top1 ={class_idx: 0 for class_idx in range(num_subjects)}
     correct_predictions_per_class_top3 ={class_idx: 0 for class_idx in range(num_subjects)}
@@ -52,10 +54,10 @@ def evaluate_user_siamese(
 
         # # compute classification accuracy
         _, pred_labels_top1 = torch.max(pred_subject_id, 1)
-        _, pred_labels_top3 = torch.topk(pred_subject_id, k=3, dim=1)
-        _, pred_labels_top5 = torch.topk(pred_subject_id, k=5, dim=1)
+        _, pred_labels_top3 = torch.topk(pred_subject_id, k=min(3, pred_subject_id.shape[1]), dim=1)
+        _, pred_labels_top5 = torch.topk(pred_subject_id, k=min(5, pred_subject_id.shape[1]), dim=1)
 
-        for class_idx in range(hparams.Data.num_subjects):
+        for class_idx in range(num_subjects):
             correct_predictions_per_class_top1[class_idx] += ((pred_labels_top1 == class_idx) & (gt_subject_id == class_idx)).sum().item()
             correct_predictions_per_class_top3[class_idx] += ((pred_labels_top3 == class_idx).any(dim=1) & (gt_subject_id == class_idx)).sum().item()
             correct_predictions_per_class_top5[class_idx] += ((pred_labels_top5 == class_idx).any(dim=1) & (gt_subject_id == class_idx)).sum().item()
@@ -95,8 +97,14 @@ def evaluate_user_siamese(
         total_pred.extend(pred_labels_top1.tolist())
         total_gt.extend(gt_subject_id.tolist())
     
+    if is_air and torch.any(class_counts == 0):
+        raise ValueError("Air-D export has a subject without support; refusing a zero embedding row")
+    if is_air and hparams.Data.fewshot_subject[0] != -1:
+        class_embeddings /= class_counts.unsqueeze(1)
+        save_subject_embeddings(class_embeddings, f'{log_dir}/fewshot_user_embedding_{hparams.Data.num_fewshot}.pt', hparams)
+        return 0
     if hparams.Data.fewshot_subject[0] != -1 and hparams.Data.num_fewshot == 1:
-        torch.save(class_embeddings, f'{log_dir}/fewshot_user_embedding_{hparams.Data.num_fewshot}.pt')
+        save_subject_embeddings(class_embeddings, f'{log_dir}/fewshot_user_embedding_{hparams.Data.num_fewshot}.pt', hparams)
         return 0
     
     avg_top1_accuracy = compute_average_accuracy(correct_predictions_per_class_top1, total_samples_per_class, num_subjects)
@@ -108,9 +116,9 @@ def evaluate_user_siamese(
     class_embeddings[nonzero_mask] /= class_counts[nonzero_mask].unsqueeze(1)
     if hparams.Data.fewshot_subject[0] != -1:
         print(f'save fewshot embedding to {log_dir}/fewshot_user_embedding_{hparams.Data.num_fewshot}.pt')
-        torch.save(class_embeddings, f'{log_dir}/fewshot_user_embedding_{hparams.Data.num_fewshot}.pt')
+        save_subject_embeddings(class_embeddings, f'{log_dir}/fewshot_user_embedding_{hparams.Data.num_fewshot}.pt', hparams)
     else:
-        torch.save(class_embeddings, f'{log_dir}/train_user_embedding_no_vsencoder.pt')
+        save_subject_embeddings(class_embeddings, f'{log_dir}/train_user_embedding_no_vsencoder.pt', hparams)
 
 
     if hparams.Data.fewshot_subject[0] != -1:

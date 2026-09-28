@@ -1,11 +1,15 @@
 # ISP-SENet Codebase Map
 
+> Current verification and corrections: see the September 28, 2026 addendum
+> at the end and `audit/AUDIT_REPORT.md`. Historical sections are not a pass claim.
+
+
 ## 0. Map Metadata
 
 - Scope: `isp-senet/**`; static inspection on 2026-09-26 at repository commit `cc7b5884e682e4f858807750774d17d5a324c8cc`.
 - Purpose: implementation navigation before changing personalization, support processing, architecture, objectives, datasets, or evaluation. Source code remains the source of truth; this is not a paper summary or a claim that published commands run unchanged.
-- Paths below are relative to `isp-senet/`. For compact references, **S** = `SE-Net`, **O** = `ISP/OSIE/GazeformerISP/src`, **F** = `ISP/COCO_FV/GazeformerISP/src`, **C** = `ISP/COCO_Search18/GazeformerISP/src`; **P** means each of O/F/C, not a shared package. Expand aliases before searching. `::<module>` denotes executable module-level code; `main.train`/`main.validation` are nested functions.
-- Inspected source/configs/launchers; did not execute training, deserialize checkpoints, or inspect dataset contents. No implementation changes accompany this map.
+- Paths below are relative to `isp-senet/`. For compact references, **S** = `SE-Net`, **O** = `ISP/OSIE/GazeformerISP/src`, **F** = `ISP/COCO_FV/GazeformerISP/src`, **C** = `ISP/COCO_Search18/GazeformerISP/src`, and **A** = `ISP/AiR/GazeformerISP/src`; **P** means the applicable predictor copy, not a shared package. Expand aliases before searching. `::<module>` denotes executable module-level code; `main.train`/`main.validation` are nested functions.
+- The implementation now includes Air-D/AiR SE-Net and predictor paths plus the inline augmented explanation loader. The historical execution hazards below remain unless explicitly overridden by the updated source.
 - Fast reuse: read sections 1 and 18 first, section 13 for edit routing, then only the relevant contracts in 6/7/9/14. All 19 numbered sections are intentional; alias-expanded file references and explicit top-level Python symbols were statically checked.
 
 ## 1. Architecture at a Glance
@@ -56,9 +60,10 @@ isp-senet/
     environment.yml                      # separate SE-Net environment
   ISP/
     README.md, environment.yml           # ISP setup/environment
-    OSIE/GazeformerISP/                   # O implementation
+    OSIE/GazeformerISP/                   # O implementation / canonical explanation copy
     COCO_FV/GazeformerISP/                # F implementation
     COCO_Search18/GazeformerISP/          # C implementation
+    AiR/GazeformerISP/                    # A implementation; AiR question grouping
       README.md                          # dataset-specific test commands
       bash/train.sh                      # training launcher (one per implementation)
       src/
@@ -80,7 +85,13 @@ isp-senet/
         utils/logger.py                  # train/test text logging
 ```
 
-The `src/` subtree repeats under all three dataset directories. O additionally has `utils/data_postprocess.py` (prediction serialization/ID recovery) and `preprocess/pseudo_fixations.py` (manual pseudo-label utility). Weights, annotations, arrays, results, and logs are omitted. Model copies are not imported from the sibling repository `gazeformer-isp/`.
+The `src/` subtree repeats under the O/F/C dataset directories; A has the
+AiR-specific dataset/CLI surface and local adapters for the same model
+contracts. O additionally has `utils/data_postprocess.py` (prediction
+serialization/ID recovery) and `preprocess/pseudo_fixations.py` (manual
+pseudo-label utility). Weights, annotations, arrays, results, and logs are
+omitted. Model copies are not imported from the sibling repository
+`gazeformer-isp/` at runtime.
 
 ## 3. Execution Flows
 
@@ -228,7 +239,7 @@ Notation: `B` = SE-Net batch, `Tse` = its padded scanpath length, `Dse` = embedd
 
 ### 6.2 ISP-SENet data path
 
-Active datasets: `O/dataset/dataset.py::{OSIE,OSIE_rl,OSIE_evaluation}` and `F/C/dataset/dataset.py::{COCOSearch,COCOSearch_rl,COCOSearch_evaluation}`. `COCOSearch_by_subject` is not used by these entry points (and references unset `self.args`).
+Active datasets: `O/dataset/dataset.py::{OSIE,OSIE_rl,OSIE_evaluation}`, `F/C/dataset/dataset.py::{COCOSearch,COCOSearch_rl,COCOSearch_evaluation}`, and `A/dataset/dataset.py::{AiR,AiR_rl,AiR_evaluation}`. `COCOSearch_by_subject` is not used by these entry points (and references unset `self.args`). Air-D groups supervised examples by `question_id`, loads flat image features, uses question-specific embeddings, and derives milliseconds from `T_end-T_start` when `T` is absent.
 
 1. Read JSON and filter exact split; `ex_subject` takes precedence over `fewshot_subject`. Group by image name for O, by task/name for F/C (C normalizes task spaces to underscores). Examples remain in annotation order, not sorted by the collator.
 2. Load `.pth` query features from `feat_dir`; one feature matrix is repeated for each subject's trajectory. Despite the name `image`, this is not RGB. Training passes RGB transforms into datasets, but the active `__getitem__` reads features instead of applying them.
@@ -598,3 +609,74 @@ METRICS                  -> P/utils/evaluation.py::comprehensive_evaluation_by_s
 CONFIG                   -> S/train.py::parse_args + S/configs/*.json;
                            P/opts.py::parse_opt + P/test.py::<module> parser
 ```
+
+## Current Air-D and explanation additions
+
+`S/common/air_data.py` translates the AiR `AiR_fixations_<split>.json`
+contract (`question_id`, `image_id`, `subject_idx`, per-record dimensions,
+`X/Y`, and `T_start/T_end`) into the existing SE-Net trajectory vocabulary.
+`S/src/builder.py` recognizes `Air-D`/`AiR`, activates question-specific task
+conditioning, and `S/configs/air_useremb.json` keeps all paths configurable.
+The existing support selection and `S/src/eval_user.py` subject-table export
+remain the SE-Net boundary.
+
+`A/dataset/dataset.py` is the Air-D predictor path. It preserves question
+grouping, flat feature paths, question-ID embeddings, subject ordering,
+per-record coordinate scaling, millisecond-to-second durations, and the
+reference performance field. `A/models/*` reuses the canonical local
+predictor/explanation implementation without importing `gazeformer-isp` at
+runtime; `A/opts.py`, `A/train.py`, and `A/test.py` expose the Air-D CLI.
+
+When explanation is enabled, O/F/C/A accept inline `prediction.fixations`,
+`prediction.regions`, and `prediction.how`. The canonical O loader validates
+raw 1-based IDs and returns `raw_to_model_idx` plus padded WHAT/WHY/HOW
+targets; F/C/A use the same contract. Source records remain unchanged when
+`--enable_explanation` is false. `--allow_truncated_how` is explicit because
+an original whole-trajectory HOW target is not automatically valid for a
+truncated model trajectory.
+
+Focused coverage is in `tests/test_air_and_augmented.py`; it uses synthetic
+CPU/offline records and features for Air-D parsing, question conditioning,
+inline validation, raw-to-model identity/removal/truncation, WHAT/WHY/HOW,
+and the disabled CLI path.
+
+## September 28, 2026 audit/remediation addendum
+
+The earlier mapping sections describe the baseline and implementation plan, not
+runtime verification. `audit/AUDIT_REPORT.md`, `audit/FINDINGS.md`, and
+`audit/TEST_RESULTS.md` record the inspected worktree, repairs, executed tests,
+and external verification blockers. No deployment rule for the R0 episode count
+or interpretation of the baseline duration distribution has been invented.
+
+- The canonical explanation implementation remains O; F/C retain local language
+  wrappers and predictor/data differences. AiR reuses the local predictor math.
+- Both augmented and legacy annotations use the same explicit raw-to-model map.
+  Surviving episode slots are reordered by their first **model-visible** fixation.
+  Truncated HOW requires an explicit, semantically justified override; no text is
+  silently rewritten. Malformed IDs, partitions, empty labels, and zero-length
+  trajectories fail instead of being repaired. Sidecars require a unique explicit
+  sample ID or the full image/subject/task-or-question/condition identity.
+- Temporal normalization uses each example's real fixation count, not padded L.
+  Frozen encoders/LLMs stay in eval mode. Gold semantic targets are deterministic
+  and detached even when the query encoder is trainable; the frozen LLM still
+  propagates gradients through its prefix inputs. Tokenizers use right padding,
+  and a missing pad token reuses EOS only when EOS exists.
+- Migration accepts a wholly base checkpoint into the explanation model, not a
+  partially missing explanation checkpoint. Parameter-set migration resets the
+  optimizer/schedule; same-model resume restores optimizer state. Ordinary
+  inference can discard reported explanation keys without instantiating text models.
+- CLI generation/latent flags now fail early with an explanation of the unresolved
+  inference contract. Programmatic latent diagnostics remain available with an
+  explicit query and fixation mask; they do not fabricate WHY/HOW active slots.
+- Air-D now has supervised/RL stages, reference metric wiring, validation,
+  checkpoint saving/resume, and checkpoint-backed serialized predictions.
+  `ISP/AiR/GazeformerISP/README.md` documents its commands and prerequisites.
+- Air-D SE-Net exports optional `<table>.subjects.json` metadata containing source
+  subject IDs in row order. The Air-D predictor consumes it for remapped/subset
+  tables. Full legacy tables continue to use raw zero-based subject_idx rows.
+  Few-shot export retains the pretrained classifier size, averages available
+  support embeddings, and does not report an unseen-subject classifier score.
+- O/F/C coordinate conventions, scanpath losses, duration ambiguity, RL objective,
+  query-position initialization, subject-table boundary, and evaluation grouping
+  remain unchanged. The sampler's random tensor now follows the input device,
+  enabling CPU checks without altering its distribution.

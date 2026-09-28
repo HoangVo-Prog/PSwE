@@ -69,6 +69,7 @@ def parse_opt():
 
     parser.add_argument("--enable_explanation", action="store_true", default=False)
     parser.add_argument("--explanation_annotations", type=str, default=None)
+    parser.add_argument("--allow_truncated_how", action="store_true", default=False)
     parser.add_argument("--explanation_dim", type=int, default=256)
     parser.add_argument("--router_kmax", type=int, default=4)
     parser.add_argument("--how_hidden_dim", type=int, default=256)
@@ -123,4 +124,8 @@ def parse_opt():
             setattr(args, k, v)
         args = parser.parse_args(namespace=args)
 
+    if args.generate_explanations or args.return_explanation_latents:
+        parser.error("R0 explanation inference is not defined; use the model API with explicit query/mask for latent diagnostics")
+    if args.enable_explanation and (not args.semantic_encoder_name or not args.explanation_llm_name):
+        parser.error("--enable_explanation requires --semantic_encoder_name and --explanation_llm_name")
     return args

@@ -93,6 +93,8 @@ class gazeformer(nn.Module):
     def __init__(self, transformer, spatial_dim, args, subject_num, subject_feature_dim, action_map_num, dropout=0.4, max_len = 7, patch_size  = 16, device = "cuda", explanation_module=None):
         super(gazeformer, self).__init__()
         self.args = args
+        if getattr(args, "generate_explanations", False):
+            raise ValueError("Natural-language explanation generation is not implemented; R0 has no deployment episode-count rule")
         self.spatial_dim = spatial_dim
         self.transformer = transformer
         self.hidden_dim = transformer.d_model
@@ -118,7 +120,9 @@ class gazeformer(nn.Module):
         # subject embeddings
         # self.subject_embed = nn.Embedding(subject_num, subject_feature_dim)
         print(f'load user embedding from {args.user_emb_path}')
-        self.subject_embed = torch.load(args.user_emb_path)
+        self.subject_embed = torch.load(args.user_emb_path, map_location="cpu")
+        if self.subject_embed.ndim != 2 or self.subject_embed.shape[1] != subject_feature_dim or self.subject_embed.shape[0] < subject_num:
+            raise ValueError("Subject embedding table must have at least subject_num rows and subject_feature_dim columns")
         #fixation embeddings
         self.querypos_embed = nn.Embedding(max_len,self.hidden_dim)
         #2D patch positional encoding
@@ -220,6 +224,7 @@ class gazeformer(nn.Module):
         aggr_action_map = (action_maps * attention_weights.unsqueeze(-1)).sum(2)
         aggr_z = (z * attention_weights.unsqueeze(-1)).sum(2)
 
+        final_action_logits = aggr_z
         if self.training == False:
             aggr_z = F.softmax(aggr_z, -1)
 
@@ -304,12 +309,12 @@ class gazeformer(nn.Module):
                 if self.explanation_module is None or explanation_inputs is None:
                     raise ValueError("Explanation diagnostics require explicit explanation_inputs query text")
                 predicts["explanation"] = self.explanation_module(
-                    predicts["decoder_states"], predicts["decoder_memory"], aggr_z,
+                    predicts["decoder_states"], predicts["decoder_memory"], final_action_logits,
                     t_log_normal_mu.permute(1, 0, 2).squeeze(2), t_log_normal_sigma2.permute(1, 0, 2).squeeze(2),
                     explanation_inputs.get("query_text", explanation_inputs.get("query_texts")),
                     explanation_inputs.get("fixation_mask", torch.ones(aggr_z.shape[:2], dtype=torch.bool, device=aggr_z.device)),
                     compute_generation=False, compute_alignment=False,
-                    action_probabilities=True,
+                    action_probabilities=False,
                 )
         
         return predicts

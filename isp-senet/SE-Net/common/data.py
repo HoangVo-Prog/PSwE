@@ -1,3 +1,4 @@
+import os
 import torch
 import random
 import torchvision.transforms as T
@@ -43,19 +44,25 @@ class Siamese_Triplet_Gaze(Dataset):
 
         if self.pa.name == 'COCO-Search18':
             task_emb_dict = np.load(f'{self.root_dir}/coco_search18_embeddings.npy', allow_pickle=True).item()
+        elif self.pa.name in ('Air-D', 'AiR', 'Air'):
+            task_embedding_path = getattr(self.pa, 'task_embedding_path', 'embeddings.npy')
+            task_path = task_embedding_path if os.path.isabs(task_embedding_path) else os.path.join(self.root_dir, task_embedding_path)
+            task_emb_dict = np.load(task_path, allow_pickle=True).item()
         else:
             task_emb_dict = np.load(f'{self.root_dir}/osie_embeddings.npy', allow_pickle=True).item()
         self.task_emb_dict = task_emb_dict
 
     def __len__(self):
         return len(self.fix_labels)
-    
+
 
     def __getitem__(self, idx):
         anchor_data = self.fix_labels[idx]
         anchor_img_name = anchor_data[0]
         anchor_subject_id = anchor_data[-3]
         anchor = self.process_data(idx)
+        if getattr(self, 'evaluation_only', False):
+            return {'anchor': anchor}
         if self.pa.num_fewshot == 1:
             positive = anchor
         else:
@@ -90,15 +97,21 @@ class Siamese_Triplet_Gaze(Dataset):
 
         if self.pa.name =='OSIE':
             # im_path = "{}/{}/{}".format(self.root_dir, self.pa.image_path, img_name)
+            im_path = os.path.join(self.pa.image_path, img_name)
+        elif self.pa.name in ('Air-D', 'AiR', 'Air'):
             im_path = "{}/{}".format(self.pa.image_path, img_name)
         else:
             if cat_name == 'none':  # coco-fv
                 # im_path = "{}/{}/{}".format(self.root_dir, self.pa.image_path, img_name)
-                im_path = "{}/{}".format(self.pa.image_path, img_name)
+                im_path = os.path.join(self.pa.image_path, img_name)
             else:  # coco-search18
                 c = cat_name.replace(' ', '_')
                 # im_path = "{}/{}/{}/{}".format(self.root_dir, self.pa.image_path, c, img_name)
-                im_path = "{}/{}/{}".format(self.pa.image_path, c, img_name)
+                im_path = os.path.join(self.pa.image_path, c, img_name)
+        if not os.path.isfile(im_path):
+            candidate = os.path.join(self.root_dir, im_path)
+            if os.path.isfile(candidate):
+                im_path = candidate
         im = Image.open(im_path).convert('RGB')
         im_tensor = self.transform(im.copy())
         assert im_tensor.shape[-1] == self.pa.im_w and im_tensor.shape[-2] == self.pa.im_h, "wrong image size."
@@ -140,11 +153,25 @@ class Siamese_Triplet_Gaze(Dataset):
         dura = torch.Tensor(dura)
 
         # process handcraft features
-        # if not is_fv:
-        #     task_emb = self.task_emb_dict[cat_name.replace(' ', '_')]
-        # else:
-        #     task_emb = list(self.task_emb_dict.values())[0]
-        task_emb = list(self.task_emb_dict.values())[0]
+        if self.pa.name in ('Air-D', 'AiR', 'Air'):
+            task_keys = [cat_name]
+            try:
+                task_keys.append(int(cat_name))
+            except (TypeError, ValueError):
+                pass
+            task_key = next((key for key in task_keys if key in self.task_emb_dict), None)
+            if task_key is None:
+                raise KeyError(
+                    "Air-D task embedding key {!r} is missing from {}".format(
+                        cat_name, getattr(self.pa, 'task_embedding_path', 'embeddings.npy')
+                    )
+                )
+            task_emb = self.task_emb_dict[task_key]
+        else:
+            # Preserve the existing offline-table behavior for the original
+            # datasets; Air-D is the only path that requires question-specific
+            # task vectors.
+            task_emb = list(self.task_emb_dict.values())[0]
 
         ret = {
             "task_id": self.fv_tid if is_fv else self.catIds[cat_name],
@@ -162,4 +189,4 @@ class Siamese_Triplet_Gaze(Dataset):
             'bbox': bbox
         }
         return ret
-    
+

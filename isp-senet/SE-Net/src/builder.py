@@ -3,6 +3,7 @@ import sys
 sys.path.append('../common')
 
 from common.dataset import process_data
+from common.air_data import load_air_scanpaths, normalize_air_scanpaths
 from .models import UserEmbeddingNet
 from common.utils import adjust_subjects
 import json
@@ -15,22 +16,53 @@ from torch.utils.data import DataLoader
 
 def build(hparams, dataset_root, device, is_eval=False, split=1):
     dataset_name = hparams.Data.name
+    configured_subject_num = hparams.Data.num_subjects
 
     bbox_annos = np.load(
         join(dataset_root, 'bbox_annos.npy'),
         allow_pickle=True).item() if dataset_name == 'COCO-Search18' else {}
 
-    with open(join(dataset_root, hparams.Data.fix_path), 'r') as json_file:
-        human_scanpaths = json.load(json_file)
+    if dataset_name in ('Air-D', 'AiR', 'Air'):
+        human_scanpaths = load_air_scanpaths(
+            dataset_root,
+            fix_path=hparams.Data.fix_path,
+            fixation_file_pattern=getattr(hparams.Data, 'fixation_file_pattern', 'AiR_fixations_{}.json'),
+        )
+        human_scanpaths = normalize_air_scanpaths(
+            human_scanpaths,
+            target_width=hparams.Data.im_w,
+            target_height=hparams.Data.im_h,
+        )
+    else:
+        with open(join(dataset_root, hparams.Data.fix_path), 'r') as json_file:
+            human_scanpaths = json.load(json_file)
     if dataset_name == 'COCO-Search18':
         n_tasks = 18
+    elif dataset_name in ('Air-D', 'AiR', 'Air'):
+        n_tasks = len({str(record['task']) for record in human_scanpaths})
     else:
         n_tasks = 1
+
+    if dataset_name in ('Air-D', 'AiR', 'Air') and hparams.Data.subject[0] != -1 and hparams.Data.fewshot_subject[0] != -1:
+        raise ValueError('Choose subject exclusion or few-shot support, not both')
 
     # hparams.Data.subject indicating which subjects are unseen subjects
     if hparams.Data.subject[0] != -1:
         print(f"skip subject {hparams.Data.subject} data!")
         human_scanpaths = adjust_subjects(human_scanpaths, hparams.Data.subject)
+
+    if dataset_name in ('Air-D', 'AiR', 'Air'):
+        subjects = sorted({record['subject'] for record in human_scanpaths})
+        if subjects != list(range(len(subjects))):
+            raise ValueError('Air-D subject_idx rows must be contiguous from zero before exporting a table')
+        hparams.Data.subject_ids = [next(record['subject_idx'] for record in human_scanpaths
+                                        if record['subject'] == row) for row in subjects]
+        hparams.Data.num_subjects = len(subjects)
+        if hparams.Data.fewshot_subject[0] != -1:
+            hparams.Data.subject_ids = list(hparams.Data.fewshot_subject)
+            if len(set(hparams.Data.subject_ids)) != len(hparams.Data.subject_ids) or not set(hparams.Data.subject_ids).issubset(subjects):
+                raise ValueError('Few-shot subject IDs must be unique and present in the Air-D records')
+            hparams.Data.num_subjects = configured_subject_num
 
     # Filtering training data
     if hparams.Data.TAP == 'TP':
@@ -51,6 +83,10 @@ def build(hparams, dataset_root, device, is_eval=False, split=1):
         hparams,
         device)
 
+    if dataset_name in ('Air-D', 'AiR', 'Air'):
+        dataset['gaze_train'].evaluation_only = is_eval
+        dataset['gaze_valid'].evaluation_only = True
+
     batch_size = hparams.Train.batch_size
     n_workers = hparams.Train.n_workers
 
@@ -60,7 +96,7 @@ def build(hparams, dataset_root, device, is_eval=False, split=1):
                                  batch_size=bs,
                                  shuffle=tag,
                                  num_workers=n_workers,
-                                 drop_last=True,
+                                 drop_last=not (is_eval and dataset_name in ('Air-D', 'AiR', 'Air')),
                                  pin_memory=True)
     print('num of training batches =', len(train_HG_loader))
 

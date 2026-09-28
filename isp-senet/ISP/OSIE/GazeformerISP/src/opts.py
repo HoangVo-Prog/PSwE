@@ -73,7 +73,9 @@ def parse_opt():
     parser.add_argument("--enable_explanation", action="store_true", default=False,
                         help="Enable differentiable WHAT/WHY-R0/HOW-R0 supervision")
     parser.add_argument("--explanation_annotations", type=str, default=None,
-                        help="Explicit explanation annotation JSON path (required when enabled for supervised training)")
+                        help="Optional sidecar JSON; inline augmented prediction annotations take precedence")
+    parser.add_argument("--allow_truncated_how", action="store_true", default=False,
+                        help="Allow HOW text whose source trajectory was truncated; use only when semantically valid")
     parser.add_argument("--explanation_dim", type=int, default=256,
                         help="Fixation/episode reasoning token dimension")
     parser.add_argument("--router_kmax", type=int, default=4,
@@ -139,4 +141,8 @@ def parse_opt():
             setattr(args, k, v)
         args = parser.parse_args(namespace=args)
 
+    if args.generate_explanations or args.return_explanation_latents:
+        parser.error("R0 explanation inference is not defined; use the model API with explicit query/mask for latent diagnostics")
+    if args.enable_explanation and (not args.semantic_encoder_name or not args.explanation_llm_name):
+        parser.error("--enable_explanation requires --semantic_encoder_name and --explanation_llm_name")
     return args

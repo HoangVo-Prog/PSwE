@@ -7,14 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from os.path import join
 import json
-from PIL import Image
-from skimage import io
-from skimage.transform import rescale, resize, downscale_local_mean
-import matplotlib.pyplot as plt
-import scipy.ndimage as filters
-from torchvision.transforms import transforms
 from tqdm import tqdm
-from scipy.io import loadmat
 from collections import defaultdict
 from models.explanation import (
     load_explanation_annotations,
@@ -59,11 +52,11 @@ class OSIE(Dataset):
         self.explanation_store = None
         if self.explanation_enabled:
             annotation_path = getattr(args, "explanation_annotations", None)
-            if not annotation_path:
-                raise ValueError(
-                    "Explanation is enabled for supervised data but --explanation_annotations was not provided"
-                )
-            self.explanation_store = load_explanation_annotations(annotation_path)
+            # Current augmented benchmark files carry ``prediction`` inline.
+            # A sidecar remains supported for legacy normalized artifacts, but
+            # is not required when the fixation file is augmented.
+            if annotation_path:
+                self.explanation_store = load_explanation_annotations(annotation_path)
 
         self.downscale_x = origin_size[1] / action_map[1]
         self.downscale_y = origin_size[0] / action_map[0]
@@ -76,6 +69,10 @@ class OSIE(Dataset):
         with open(self.fixations_file) as json_file:
             fixations = json.load(json_file)
         fixations = [_ for _ in fixations if _["split"] == type]
+
+        if self.explanation_enabled:
+            for fixation in fixations:
+                fixation["explanation_source_subject"] = fixation["subject"]
 
         if self.args.ex_subject[0] != -1:
             fixations = adjust_subjects(fixations, self.args.ex_subject)
@@ -103,6 +100,7 @@ class OSIE(Dataset):
         return len(self.imgid)
 
     def show_image(self, img):
+        import matplotlib.pyplot as plt
         plt.figure()
         plt.imshow(img)
         plt.show()
@@ -132,9 +130,27 @@ class OSIE(Dataset):
             duration_mask = np.zeros(self.max_length, dtype=np.float32)
             task = "free-viewing"
 
+            if self.explanation_enabled:
+                raw_annotation = lookup_explanation_annotation(self.explanation_store, fixation)
+                annotation = normalize_explanation_annotation(
+                    raw_annotation, self.max_length, getattr(self.args, "router_kmax", 4),
+                    model_raw_indices=list(range(1, min(len(fixation["X"]), self.max_length) + 1)),
+                    allow_truncated_how=getattr(self.args, "allow_truncated_how", False))
+                if not (len(fixation["X"]) == len(fixation["Y"]) == len(fixation["T"])):
+                    raise ValueError("Raw scanpath must satisfy len(X)==len(Y)==len(T)")
+                explanation_annotations.append(annotation)
+
             pos_x = np.array(fixation["X"]).astype(np.float32)
             pos_y = np.array(fixation["Y"]).astype(np.float32)
             duration_raw = np.array(fixation["T"]).astype(np.float32)
+            if self.explanation_enabled:
+                if not np.isfinite(np.concatenate((pos_x, pos_y, duration_raw))).all() or (duration_raw <= 0).any():
+                    raise ValueError("Explanation scanpaths require finite coordinates and positive durations")
+                cols = ((pos_x - 1) / self.downscale_x).astype(np.int32)
+                rows = ((pos_y - 1) / self.downscale_y).astype(np.int32)
+                if (pos_x < 0).any() or (pos_y < 0).any() or (cols < 0).any() or (cols >= self.action_map[1]).any() or (rows < 0).any() or (rows >= self.action_map[0]).any():
+                    raise ValueError("Explanation fixation cannot map to STOP or an out-of-grid action")
+
 
             pos_x_discrete = np.zeros(self.max_length, dtype=np.int32) - 1
             pos_y_discrete = np.zeros(self.max_length, dtype=np.int32) - 1
@@ -157,6 +173,7 @@ class OSIE(Dataset):
                 else:
                     scanpath[index, pos_y_discrete[index], pos_x_discrete[index]] = 1
                     if self.blur_sigma:
+                        import scipy.ndimage as filters
                         scanpath[index] = filters.gaussian_filter(scanpath[index], self.blur_sigma)
                         scanpath[index] /= scanpath[index].sum()
                     target_scanpath[index, 1:] = scanpath[index].reshape(-1)
@@ -170,11 +187,7 @@ class OSIE(Dataset):
             task_embedding = self.embedding_dict[task]
             task_embeddings.append(task_embedding)
             target_scanpaths.append(target_scanpath)
-            if self.explanation_enabled:
-                raw_annotation = lookup_explanation_annotation(self.explanation_store, fixation)
-                explanation_annotations.append(
-                    normalize_explanation_annotation(raw_annotation, self.max_length, getattr(self.args, "router_kmax", 4))
-                )
+
 
 
         images = torch.cat(images)
@@ -314,6 +327,7 @@ class OSIE_rl(Dataset):
         return len(self.imgid)
 
     def show_image(self, img):
+        import matplotlib.pyplot as plt
         plt.figure()
         plt.imshow(img)
         plt.show()
@@ -471,6 +485,7 @@ class OSIE_evaluation(Dataset):
         return len(self.imgid)
 
     def show_image(self, img):
+        import matplotlib.pyplot as plt
         plt.figure()
         plt.imshow(img)
         plt.show()

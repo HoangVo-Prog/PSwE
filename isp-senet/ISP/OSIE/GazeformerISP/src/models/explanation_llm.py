@@ -92,6 +92,7 @@ class SemanticEncoderWrapper(nn.Module):
         if self.freeze:
             for parameter in self.encoder.parameters():
                 parameter.requires_grad_(False)
+            self.encoder.eval()
 
     def _tokenized_encode(self, texts: list[str]) -> Tensor:
         if self.tokenizer is None:
@@ -114,6 +115,21 @@ class SemanticEncoderWrapper(nn.Module):
                 weights = mask.to(hidden.dtype).unsqueeze(-1)
                 hidden = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
         return hidden
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:
+            self.encoder.eval()
+        return self
+
+    def encode_target(self, texts):
+        training = self.encoder.training
+        self.encoder.eval()
+        try:
+            with torch.no_grad():
+                return self.encode(texts).detach()
+        finally:
+            self.encoder.train(training and not self.freeze)
 
     def encode(self, texts: Sequence[str] | str) -> Tensor:
         text_list = _as_text_list(texts)
@@ -197,6 +213,12 @@ class SharedExplanationLLM(nn.Module):
                 tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.llm = llm
         self.tokenizer = tokenizer
+        if tokenizer is not None and hasattr(tokenizer, "pad_token_id"):
+            if tokenizer.pad_token_id is None:
+                if getattr(tokenizer, "eos_token_id", None) is None:
+                    raise ValueError("Causal tokenizer requires a padding token or an EOS token")
+                tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "right"
         self.hidden_dim = _get_hidden_size(llm, hidden_dim)
         self.query_dim = int(query_dim or semantic_dim)
         self.branch_tokens = nn.ParameterDict({
@@ -216,6 +238,13 @@ class SharedExplanationLLM(nn.Module):
         if self.freeze:
             for parameter in self.llm.parameters():
                 parameter.requires_grad_(False)
+            self.llm.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:
+            self.llm.eval()
+        return self
 
     def _prefix(self, branch: str, query: Tensor, latent: Tensor) -> Tensor:
         if branch not in self.BRANCHES:

@@ -94,6 +94,10 @@ parser.add_argument("--return_explanation_latents", action="store_true", default
 parser.add_argument("--generate_explanations", action="store_true", default=False)
 
 args = parser.parse_args()
+if args.generate_explanations or args.return_explanation_latents:
+    parser.error("R0 explanation inference is not defined; use the model API for latent diagnostics")
+if args.enable_explanation and (not args.semantic_encoder_name or not args.explanation_llm_name):
+    parser.error("Explanation checkpoint reconstruction requires semantic and causal model names")
 
 # For reproducibility - refer https://pytorch.org/docs/stable/notes/randomness.html
 # These five lines control all the major sources of randomness.

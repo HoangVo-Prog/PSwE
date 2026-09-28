@@ -57,7 +57,7 @@ class FakeCausalLM(nn.Module):
         return self.embedding
 
     def forward(self, inputs_embeds, attention_mask=None, labels=None):
-        logits = self.readout(inputs_embeds)
+        logits = self.readout((inputs_embeds * attention_mask.unsqueeze(-1)).cumsum(dim=1))
         loss = None
         if labels is not None:
             loss = nn.functional.cross_entropy(
